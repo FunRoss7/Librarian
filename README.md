@@ -1,130 +1,217 @@
 # Librarian
 
-An offline-first RAG (Retrieval-Augmented Generation) system optimized for natural language queries over heterogeneous local sources. Designed for environments where cloud AI tools are not permitted — proprietary, regulated, or simply air-gapped.
+A local, private reasoning tool for systems engineers. Not a search engine.
 
-The primary use case is **requirements extraction and validation from stakeholder discussions**: load meeting notes, transcripts, sketches, and documents into a named project, ask natural language questions, and get answers grounded in your actual source material with the originals surfaced for human verification.
+Librarian detects gaps, contradictions, and missing rationale across a corpus of engineering artifacts and customer discussions — and generates the next right question to ask. All inference runs on-device; no data leaves the machine.
 
----
-
-## What Makes It Special
-
-Most RAG tools are generic document Q&A. Librarian is designed around a specific, harder workflow:
-
-**1. Analog-to-digital translation pipeline**
-Non-text sources (images of whiteboard sketches, audio recordings, subtitle files) are translated to clean, high-fidelity prose before embedding. This translation is a first-class artifact stored alongside the original — not a lossy preprocessing step.
-
-**2. Project scoping**
-All sources and queries are isolated within a named project (e.g., `acme-requirements-q1-2026`). You are never querying across projects unless you explicitly ask to. This mirrors how knowledge work actually happens.
-
-**3. The feasibility loop**
-Beyond simple Q&A, Librarian supports a research query mode: given a question like *"why not use approach X?"*, the system retrieves candidate sources, filters them with the LLM for relevance, and presents the **original source excerpts** to the user — not a synthesized answer. The human makes the call; the LLM does the legwork.
-
-**4. No cloud dependencies**
-Every component — embedding, inference, storage — runs locally via Ollama. No data leaves the machine. Suitable for proprietary and regulated environments.
+The primary use case is **systems engineering work where the hard problem is not finding information but knowing what is missing**: requirements without documented rationale, design decisions without constraint coverage, questions that haven't been asked yet.
 
 ---
 
-## Notional Architecture
+## The Problem With Standard RAG
+
+Standard RAG retrieves documents similar to a query. That is sufficient for lookup questions but fails for systems engineering work, which requires:
+
+- **Completeness checking** — "Do we have enough information to build a prototype?" requires detecting *absence*, which cosine similarity cannot do
+- **Contradiction detection** — "Why wouldn't this simpler design work?" requires holding a proposed solution against documented constraints and finding conflicts
+- **Rationale tracing** — "Did the customer ever explain why this is a requirement?" — requirements without rationale are brittle; the tool should flag them explicitly
+- **Gap-driven question generation** — the most valuable output is often not an answer but the *next question*: one that targets a specific missing piece of information
+
+---
+
+## Core Insight
+
+A hard query like "do we have enough to build a prototype?" can be decomposed into a set of smaller, answerable sub-queries. Each sub-query can be grounded against the corpus. The *compilation* of those results — including which sub-queries returned weak or no results — is where gap detection lives.
+
+Weak retrieval on a sub-query is the gap signal. The system does not build a global knowledge graph upfront; it extracts structure at query time from already-retrieved content. Attempt the problem, go looking only when you hit a specific gap.
+
+---
+
+## North Star Behavior
+
+An engineer asks:
+
+> "Would a design that omits the secondary power bus work?"
+
+The tool returns:
+
+> "No. The customer specified in [artifact, date] that all subsystems must maintain operation during primary bus failure. No rationale was documented for this requirement. Suggested question for next customer meeting: 'Is the single-failure power isolation requirement driven by a specific mission scenario or a general reliability standard?'"
+
+Grounded answer. Gap identified. Next question generated.
+
+---
+
+## Architecture
+
+### Ingestion
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        INGESTION                        │
-│                                                         │
-│  source file                                            │
-│      │                                                  │
-│      ▼                                                  │
-│  [file type?]                                           │
-│   text/PDF/DOCX ──► extract text ──────────────────┐   │
-│   image/sketch  ──► llava (Ollama) ──► prose desc  │   │
-│   audio/SRT     ──► Whisper / raw text ────────────┤   │
-│                                                    │   │
-│                                            high-fi text │
-│                                                    │   │
-│                                            ▼           │
-│                                        chunk text       │
-│                                      (400 tok / 50 overlap)
-│                                            │           │
-│                                            ▼           │
-│                                  nomic-embed-text       │
-│                                     (Ollama)            │
-│                                            │           │
-│                                       embeddings        │
-│                                            │           │
-│              ┌─────────────────────────────┤           │
-│              ▼                             ▼           │
-│          SQLite                        ChromaDB         │
-│  (source metadata,              (chunk text + vectors,  │
-│   high-fi text,                  keyed to source_id)    │
-│   project registry)                                     │
-└─────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────┐
-│                      QUERY (RAG)                        │
-│                                                         │
-│  user query                                             │
-│      │                                                  │
-│      ▼                                                  │
-│  nomic-embed-text ──► query vector                      │
-│      │                                                  │
-│      ▼                                                  │
-│  ChromaDB cosine similarity ──► top-k chunks            │
-│      │                                                  │
-│      ▼                                                  │
-│  fetch high-fi text for matched sources (SQLite)        │
-│      │                                                  │
-│      ▼                                                  │
-│  LLM prompt: [context excerpts] + [query] ──► answer    │
-│      │                                                  │
-│      ▼                                                  │
-│  present original source files to user                  │
-└─────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────┐
-│                   FEASIBILITY LOOP                      │
-│                                                         │
-│  "why not X?" query                                     │
-│      │                                                  │
-│      ▼                                                  │
-│  similarity search ──► top-20 candidate chunks          │
-│      │                                                  │
-│      ▼                                                  │
-│  single LLM call: rank/filter candidates by relevance   │
-│      │                                                  │
-│      ▼                                                  │
-│  top-5 results with LLM relevance summary               │
-│      │                                                  │
-│      ▼                                                  │
-│  present original source excerpts to user               │
-│  (user decides — LLM does not conclude)                 │
-└─────────────────────────────────────────────────────────┘
+source file
+    │
+    ▼
+[file type?]
+ text/PDF/DOCX ──► extract text ──────────────────┐
+ image/sketch  ──► llava (Ollama) ──► prose desc  │
+ audio/SRT     ──► Whisper / raw text ────────────┤
+                                                  │
+                                          high-fi text
+                                                  │
+                                                  ▼
+                                              chunk text
+                                                  │
+                                                  ▼
+                                        embedding model
+                                           (Ollama)
+                                                  │
+                             ┌────────────────────┤
+                             ▼                    ▼
+                         SQLite               ChromaDB
+                 (source metadata,    (chunk text + vectors,
+                  high-fi text,        keyed to source_id)
+                  project registry)
 ```
 
-**Database schema (SQLite)**
+Four artifacts per source: original file, high-fidelity text, chunks, embeddings. The text translation is a first-class artifact, not a lossy preprocessing step.
+
+---
+
+### Query Pipeline
 
 ```
-projects    id, name, description, created_at
-sources     id, project_id, original_path, file_type, ingested_at
-documents   id, source_id, high_fi_text
+user query
+    │
+    ▼
+┌─────────────────────────────────────┐
+│        QUERY DECOMPOSITION          │
+│                                     │
+│  LLM decomposes into 3-5            │
+│  atomic sub-queries                 │
+│                                     │
+│  consistency check:                 │
+│  vector_sum(sub-queries) ≈ original │
+│  (cosine similarity threshold)      │
+│  → re-decompose if check fails      │
+└────────────────┬────────────────────┘
+                 │ sub-queries
+                 ▼
+┌─────────────────────────────────────┐
+│        HyDE RETRIEVAL               │
+│        (per sub-query)              │
+│                                     │
+│  LLM generates hypothetical         │
+│  answer document for sub-query      │
+│         │                           │
+│         ▼                           │
+│  embed hypothetical document        │
+│  (document-shaped embeddings        │
+│   navigate corpus better than       │
+│   question-shaped embeddings)       │
+│         │                           │
+│         ▼                           │
+│  cosine similarity → top-k chunks   │
+│                                     │
+│  ★ low confidence = gap signal      │
+└────────────────┬────────────────────┘
+                 │ retrieved chunks + gap flags
+                 ▼
+┌─────────────────────────────────────┐
+│        SYNTHESIS                    │
+│                                     │
+│  compile all sub-query results      │
+│  (including weak/empty results)     │
+│                                     │
+│  query-time structure extraction:   │
+│  LLM identifies relationships,      │
+│  contradictions, and absent         │
+│  rationale from retrieved content   │
+│                                     │
+│  structured output:                 │
+│  • Answer (grounded in evidence)    │
+│  • Confidence                       │
+│  • Gaps (weak sub-queries)          │
+│  • Suggested Next Questions         │
+└─────────────────────────────────────┘
 ```
 
-**ChromaDB**: one collection per project, each record holds chunk text + embedding vector + source_id foreign key.
+**On gap signals:** A weak retrieval result has two possible causes — the information genuinely doesn't exist in the corpus, or retrieval failed despite it being present (vocabulary mismatch, unusual phrasing). HyDE reduces the second type of error but doesn't eliminate it. Human review is appropriate before acting on a gap.
+
+---
+
+## Build Phases
+
+### Phase 1 — Grounded Retrieval (MVP)
+**Goal:** Load artifacts, ask simple questions, get grounded answers with source citations.
+
+- Set up Ollama with a base LLM
+- Set up ChromaDB locally
+- Build ingestion pipeline: PDF, DOCX, plain text → chunks → embeddings → vector store
+- Build basic RAG query loop: embed query → retrieve top-k → LLM generates answer with citations
+- Validate on real artifacts
+
+**Deliverable:** Working local RAG over an engineering corpus.
+
+---
+
+### Phase 2 — Query Decomposition + Consistency Check
+**Goal:** Break hard queries into sub-queries and validate the decomposition geometrically.
+
+- Prompt the LLM to decompose a complex query into 3–5 atomic sub-queries
+- Embed the original query and all sub-queries
+- Compute vector sum of sub-query embeddings; check cosine similarity against original query embedding
+- If similarity is below threshold, re-prompt for a different decomposition
+- Run retrieval independently per sub-query; compile results grouped by sub-query
+
+**Deliverable:** Decomposed query answering with per-sub-query evidence.
+
+---
+
+### Phase 3 — HyDE Integration
+**Goal:** Improve retrieval quality by searching with hypothetical answer documents.
+
+- For each sub-query, prompt LLM: "Write a short technical document that would answer this question"
+- Embed the hypothetical document instead of the raw sub-query
+- Use that embedding for corpus retrieval
+- Compare retrieval quality against Phase 2 baseline on known test queries
+
+**Deliverable:** Measurably improved retrieval on complex sub-queries.
+
+---
+
+### Phase 4 — Gap Detection and Query-Time Structure Extraction
+**Goal:** Make absence visible; generate targeted follow-up questions.
+
+- Flag sub-queries with weak or empty retrieval as explicit gaps
+- At synthesis time, prompt LLM to extract typed relationships from retrieved chunks (supports, contradicts, requires, rationale-for) — structure extracted only from content already shown to be relevant
+- Surface gaps explicitly in query responses: "This requirement has no documented rationale"
+- Generate targeted follow-up questions for each gap
+
+**Deliverable:** Gap report per query; suggested customer discussion agenda generated automatically.
+
+---
+
+### Phase 5 — Contradiction Detection
+**Goal:** Answer "why wouldn't this simpler design work?" by checking a proposed design against corpus constraints.
+
+- Accept a proposed design as input (text description or structured spec)
+- Decompose and retrieve relevant constraints from the corpus
+- Identify constraints that the proposed design violates or leaves unaddressed
+- Return: specific constraints violated, source artifacts, rationale if present
+
+**Deliverable:** Automated design review against corpus constraints.
 
 ---
 
 ## Open Decisions
 
-### D1 — Framework: LlamaIndex vs. PrivateGPT vs. raw
+### D1 — Framework: LlamaIndex vs. raw
 
-**Question:** Should we build on LlamaIndex (framework), adopt PrivateGPT (full application), or implement the RAG pipeline directly against ChromaDB and Ollama?
+**Question:** Build on LlamaIndex for orchestration primitives, or implement the pipeline directly against ChromaDB and Ollama?
 
-**Stakes:** This is the highest-leverage decision. It determines development velocity, how much control we have over the feasibility loop, and long-term maintainability.
+**Stakes:** Highest-leverage decision. Determines how much boilerplate is needed to implement query decomposition, HyDE, and the synthesis loop cleanly.
 
 **Options:**
-- **PrivateGPT** — ships with ingestion, embedding, Ollama integration, project workspaces, and a REST API. Low build cost, but the feasibility loop would be bolted on via its API and may hit abstraction limits.
-- **LlamaIndex** — handles chunking, embedding, vector store, and Ollama integration as a framework. More boilerplate than PrivateGPT, but full control over every stage including the feasibility loop.
-- **Raw** — direct calls to Ollama API + ChromaDB + SQLite. Maximum control, maximum build cost. Justified only if frameworks prove too constraining.
-
-→ *See Experiment 1 and Experiment 2*
+- **LlamaIndex** — handles chunking, embedding, vector store, and Ollama integration. More control than PrivateGPT. Need to verify it doesn't fight the decomposition + HyDE pattern.
+- **Raw** — direct calls to Ollama API + ChromaDB + SQLite. Maximum control, maximum build cost. Justified if LlamaIndex abstractions resist the custom query pipeline.
 
 ---
 
@@ -132,158 +219,34 @@ documents   id, source_id, high_fi_text
 
 **Question:** Which embedding model gives the best retrieval quality at acceptable CPU latency?
 
-**Stakes:** Embedding quality directly determines retrieval quality. A poor embedding model means relevant sources get missed regardless of LLM quality.
-
 **Candidates:**
-- `nomic-embed-text` via Ollama — consistent with keeping everything in the Ollama stack
-- `all-MiniLM-L6-v2` via `sentence-transformers` — very fast on CPU, well-benchmarked
-- `bge-small-en-v1.5` via `sentence-transformers` — consistently outperforms MiniLM on retrieval tasks
+- `nomic-embed-text` via Ollama
+- `all-MiniLM-L6-v2` via `sentence-transformers` — very fast on CPU
+- `bge-small-en-v1.5` via `sentence-transformers` — consistently outperforms MiniLM on retrieval benchmarks
 
-→ *See Experiment 3*
+Note: the vector sum consistency check in Phase 2 may behave differently across embedding models — worth testing.
 
 ---
 
-### D3 — LLM selection for CPU-only inference
+### D3 — LLM for CPU-only inference
 
 **Question:** Which Ollama model gives the best quality/latency tradeoff with no GPU?
 
-**Stakes:** On CPU, a 7B model may take 30–90 seconds per response. Smaller models respond faster but may produce lower quality translations and summaries.
-
 **Candidates:**
-- `phi3:mini` (3.8B) — Microsoft, strong reasoning for its size, fast on CPU
-- `llama3.2:3b` — Meta, good instruction following, smallest viable
-- `mistral:7b-q4_K_M` — best quality of the group, slowest on CPU
-- `qwen2.5:3b` — strong multilingual, competitive with llama3.2 at same size
+- `phi3:mini` (3.8B) — fast on CPU, strong reasoning for its size
+- `llama3.2:3b` — good instruction following, smallest viable
+- `mistral:7b-q4_K_M` — best quality, slowest on CPU
+- `qwen2.5:3b` — competitive with llama3.2 at same size
 
-→ *See Experiment 3*
+The decomposition and HyDE steps require reliable instruction following; quality matters more here than in simple Q&A.
 
 ---
 
 ### D4 — Chunk size and overlap
 
-**Question:** What chunk size and overlap produces the best retrieval on requirements-style documents (meeting notes, transcripts, spec documents)?
+**Question:** What chunk size and overlap produces the best retrieval on requirements-style documents?
 
-**Stakes:** Too small and chunks lose context; too large and dissimilar content gets bundled into one embedding, reducing precision.
-
-**Candidates to test:** 256 / 512 / 1024 tokens, with 10% and 25% overlap.
-
-→ *See Experiment 4*
-
----
-
-### D5 — Feasibility loop: single-pass vs. two-stage filtering
-
-**Question:** Should the feasibility loop filter results with one LLM call over all candidates, or run two stages (embed filter → LLM rerank)?
-
-**Stakes:** On CPU, multiple LLM calls compound. A single batch LLM call over top-20 chunks is likely faster and good enough, but two-stage may give higher precision.
-
-→ *See Experiment 5*
-
----
-
-## Research Regimen
-
-The goal of these experiments is to make the open decisions above with evidence, not intuition. All experiments run CPU-only on a standard laptop. Each experiment produces a written finding that closes one decision.
-
----
-
-### Experiment 1 — PrivateGPT evaluation
-
-**Closes:** D1 (partial)
-
-**Setup:**
-1. Install PrivateGPT with Ollama backend (`pip install private-gpt`)
-2. Configure to use `nomic-embed-text` for embeddings and `mistral:7b-q4` for inference
-3. Prepare a sample dataset: 3–5 documents representing a realistic stakeholder meeting — e.g., a meeting transcript (plain text), a requirements doc (PDF), and a sketch description (manually written prose standing in for llava output)
-
-**Tasks to evaluate:**
-- Ingest all documents into a named workspace
-- Query: *"What performance requirements were mentioned?"*
-- Query: *"Who expressed concern about the timeline?"*
-- Query: *"Are there any conflicting requirements between the two documents?"*
-- Attempt to implement the feasibility loop via the PrivateGPT REST API
-
-**Record:**
-- Response quality (0–5 subjective rating per query)
-- Ingestion time
-- Query latency
-- How much custom code was needed for the feasibility loop
-- Blockers or abstraction limits hit
-
----
-
-### Experiment 2 — LlamaIndex evaluation
-
-**Closes:** D1 (partial), compare with Experiment 1
-
-**Setup:**
-1. `pip install llama-index llama-index-llms-ollama llama-index-embeddings-ollama chromadb`
-2. Build a minimal RAG pipeline: ingest same sample dataset, project-scoped ChromaDB collection, query interface
-3. Implement the feasibility loop: retrieve top-20, single LLM filter call, return top-5 with originals
-
-**Tasks to evaluate:** Same queries as Experiment 1 for direct comparison.
-
-**Record:** Same metrics. Additional: lines of code to implement feasibility loop. Points where LlamaIndex abstractions helped vs. fought the implementation.
-
-**Decision rule:** If LlamaIndex feasibility loop implementation is clean (< ~150 lines, no major workarounds) and query quality is comparable to PrivateGPT, prefer LlamaIndex for control. If PrivateGPT REST API supports the feasibility loop cleanly, prefer it for lower maintenance burden.
-
----
-
-### Experiment 3 — Embedding model and LLM benchmarking
-
-**Closes:** D2, D3
-
-**Setup:**
-1. Fix the framework (use result of Experiments 1–2)
-2. Prepare a retrieval test set: 10 queries with known ground-truth relevant documents from the sample dataset
-3. Test each embedding model: `nomic-embed-text`, `all-MiniLM-L6-v2`, `bge-small-en-v1.5`
-4. For each embedding model, record: recall@5 (how many of the 5 retrieved chunks contain the ground-truth answer), indexing time, query embedding latency
-
-**For LLM benchmarking:**
-1. Fix the best embedding model from above
-2. Test `phi3:mini`, `llama3.2:3b`, `mistral:7b-q4_K_M`, `qwen2.5:3b`
-3. For each: run the 10 queries, rate answer quality (0–5), record time-to-first-token and total response time on CPU
-
-**Decision rule:** Pick the embedding model with highest recall@5. For LLM, if `phi3:mini` or `llama3.2:3b` scores within 1 point of `mistral:7b-q4` on average quality, prefer the smaller model for latency. If `mistral:7b` quality is clearly better, use it and accept the latency.
-
----
-
-### Experiment 4 — Chunk size optimization
-
-**Closes:** D4
-
-**Setup:**
-1. Re-ingest the sample dataset 6 times: chunks of 256/512/1024 tokens × 10%/25% overlap
-2. Run the same 10 ground-truth queries against each index
-3. Record recall@5 for each configuration
-
-**Decision rule:** Pick the configuration with highest recall@5. In case of tie, prefer smaller chunks (faster embedding, lower context window usage at query time).
-
----
-
-### Experiment 5 — Feasibility loop design
-
-**Closes:** D5
-
-**Setup:**
-1. Use the best configuration from Experiments 1–4
-2. Prepare 5 feasibility queries (e.g., *"Why not build this as a microservice?"*, *"Why not use a relational database for storage?"*)
-3. Implement and compare:
-   - **Single-pass:** retrieve top-20 chunks, one LLM call with all 20, return top-5
-   - **Two-stage:** retrieve top-20 chunks, LLM call to score each independently, return top-5
-
-**Record:** Total latency end-to-end, quality of filtered results (subjective 0–5), number of LLM calls.
-
-**Decision rule:** If single-pass latency is less than 2× two-stage and quality is within 1 point, use single-pass. Fewer LLM calls is strongly preferred on CPU.
-
----
-
-## Stretch Goals
-
-- **Audio transcription** — local Whisper (`openai-whisper`, `base` model on CPU) for meeting recordings
-- **Speaker diarization** — `pyannote.audio` to attribute transcript lines to speakers; requires HuggingFace model download, runs locally
-- **Vision ingestion** — `llava` via Ollama to describe whiteboard sketches and handwritten notes; requires model swap on 6GB GPU (not relevant for CPU-only setup)
-- **Cross-project search** — explicit mode to query across all projects simultaneously
+**Candidates:** 256 / 512 / 1024 tokens × 10% / 25% overlap.
 
 ---
 
@@ -291,6 +254,21 @@ The goal of these experiments is to make the open decisions above with evidence,
 
 | Config | LLM | Embedding | Notes |
 |---|---|---|---|
-| CPU only | `phi3:mini` or `llama3.2:3b` | `bge-small-en-v1.5` | Slow but functional; ~30–60s per query |
-| 6GB GPU | `mistral:7b-q4_K_M` | `nomic-embed-text` | Comfortable fit; ~3–5s per query |
-| 6GB GPU + vision | `llava:7b-q4` for ingestion, `mistral:7b-q4` for query | `nomic-embed-text` | Ollama swaps models; image ingestion slow |
+| CPU only | `phi3:mini` or `llama3.2:3b` | `bge-small-en-v1.5` | Slow but functional; decomposition adds latency |
+| 6GB GPU | `mistral:7b-q4_K_M` | `nomic-embed-text` | Comfortable fit; practical for daily use |
+
+---
+
+## Key Dependencies
+
+- **Ollama** — local LLM and embedding model serving
+- **ChromaDB** or **Qdrant** — local vector store
+- **SQLite** — source metadata and high-fidelity text storage
+- **LlamaIndex** — orchestration (pending D1)
+- **FastAPI** — thin API layer for future UI integration
+- **Python** — primary implementation language
+
+**Stretch:**
+- **Whisper** (`openai-whisper`) — audio transcription for meeting recordings
+- **pyannote.audio** — speaker diarization
+- **llava** via Ollama — whiteboard sketch and image ingestion
